@@ -1,4 +1,4 @@
-// Copyright (c) 2020-2022 Tigera, Inc. All rights reserved.
+// Copyright (c) 2020-2024 Tigera, Inc. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -158,7 +158,8 @@ type Config struct {
 	DeviceRouteSourceAddressIPv6   net.IP
 	DeviceRouteProtocol            netlink.RouteProtocol
 	RemoveExternalRoutes           bool
-	IptablesRefreshInterval        time.Duration
+	IPForwarding                   string
+	TableRefreshInterval           time.Duration
 	IptablesPostWriteCheckInterval time.Duration
 	IptablesInsertMode             string
 	IptablesLockFilePath           string
@@ -224,6 +225,7 @@ type Config struct {
 	BPFEnforceRPF                      string
 	BPFDisableGROForIfaces             *regexp.Regexp
 	BPFExcludeCIDRsFromNAT             []string
+	BPFRedirectToPeer                  string
 	KubeProxyMinSyncPeriod             time.Duration
 	SidecarAccelerationEnabled         bool
 	ServiceLoopPrevention              string
@@ -384,8 +386,8 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		ruleRenderer = rules.NewRenderer(config.RulesConfig)
 	}
 	epMarkMapper := rules.NewEndpointMarkMapper(
-		config.RulesConfig.IptablesMarkEndpoint,
-		config.RulesConfig.IptablesMarkNonCaliEndpoint)
+		config.RulesConfig.MarkEndpoint,
+		config.RulesConfig.MarkNonCaliEndpoint)
 
 	// Auto-detect host MTU.
 	hostMTU, err := findHostMTU(config.MTUIfacePattern)
@@ -435,7 +437,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 	iptablesOptions := iptables.TableOptions{
 		HistoricChainPrefixes: rules.AllHistoricChainNamePrefixes,
 		InsertMode:            config.IptablesInsertMode,
-		RefreshInterval:       config.IptablesRefreshInterval,
+		RefreshInterval:       config.TableRefreshInterval,
 		PostWriteInterval:     config.IptablesPostWriteCheckInterval,
 		LockTimeout:           config.IptablesLockTimeout,
 		LockProbeInterval:     config.IptablesLockProbeInterval,
@@ -445,7 +447,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		OpRecorder:            dp.loopSummarizer,
 	}
 	nftablesOptions := nftables.TableOptions{
-		RefreshInterval:  config.IptablesRefreshInterval,
+		RefreshInterval:  config.TableRefreshInterval,
 		LookPathOverride: config.LookPathOverride,
 		OnStillAlive:     dp.reportHealth,
 		OpRecorder:       dp.loopSummarizer,
@@ -909,6 +911,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 		config.BPFEnabled,
 		bpfEndpointManager,
 		callbacks,
+		config.BPFLogLevel,
 		config.FloatingIPsEnabled,
 		config.RulesConfig.NFTables,
 	)
@@ -1042,6 +1045,7 @@ func NewIntDataplaneDriver(config Config) *InternalDataplane {
 			config.BPFEnabled,
 			nil,
 			callbacks,
+			config.BPFLogLevel,
 			config.FloatingIPsEnabled,
 			config.RulesConfig.NFTables,
 		))
@@ -2148,18 +2152,22 @@ func (d *InternalDataplane) configureKernel() {
 	out, err := mp.Exec()
 	log.WithError(err).WithField("output", out).Infof("attempted to modprobe %s", moduleConntrackSCTP)
 
-	log.Info("Making sure IPv4 forwarding is enabled.")
-	err = writeProcSys("/proc/sys/net/ipv4/ip_forward", "1")
-	if err != nil {
-		log.WithError(err).Error("Failed to set IPv4 forwarding sysctl")
-	}
-
-	if d.config.IPv6Enabled {
-		log.Info("Making sure IPv6 forwarding is enabled.")
-		err = writeProcSys("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+	if d.config.IPForwarding == "Enabled" {
+		log.Info("Making sure IPv4 forwarding is enabled.")
+		err = writeProcSys("/proc/sys/net/ipv4/ip_forward", "1")
 		if err != nil {
-			log.WithError(err).Error("Failed to set IPv6 forwarding sysctl")
+			log.WithError(err).Error("Failed to set IPv4 forwarding sysctl")
 		}
+
+		if d.config.IPv6Enabled {
+			log.Info("Making sure IPv6 forwarding is enabled.")
+			err = writeProcSys("/proc/sys/net/ipv6/conf/all/forwarding", "1")
+			if err != nil {
+				log.WithError(err).Error("Failed to set IPv6 forwarding sysctl")
+			}
+		}
+	} else {
+		log.Info("IPv4 forwarding disabled by config, leaving sysctls untouched.")
 	}
 
 	if d.config.BPFEnabled && d.config.BPFDisableUnprivileged {
@@ -2301,13 +2309,14 @@ func (d *InternalDataplane) apply() {
 	// Update the routing table in parallel with the other updates.  We'll wait for it to finish
 	// before we return.
 	var routesWG sync.WaitGroup
+	var numBackgroundProblems atomic.Uint64
 	for _, r := range d.routeTableSyncers() {
 		routesWG.Add(1)
 		go func(r routetable.SyncerInterface) {
 			err := r.Apply()
 			if err != nil {
 				log.Warn("Failed to synchronize routing table, will retry...")
-				d.dataplaneNeedsSync = true
+				numBackgroundProblems.Add(1)
 			}
 			d.reportHealth()
 			routesWG.Done()
@@ -2323,7 +2332,7 @@ func (d *InternalDataplane) apply() {
 			err := r.Apply()
 			if err != nil {
 				log.Warn("Failed to synchronize routing rules, will retry...")
-				d.dataplaneNeedsSync = true
+				numBackgroundProblems.Add(1)
 			}
 			d.reportHealth()
 			rulesWG.Done()
@@ -2378,6 +2387,10 @@ func (d *InternalDataplane) apply() {
 
 	// Wait for the rule updates to finish.
 	rulesWG.Wait()
+
+	if numBackgroundProblems.Load() > 0 {
+		d.dataplaneNeedsSync = true
+	}
 
 	// And publish and status updates.
 	d.endpointStatusCombiner.Apply()
